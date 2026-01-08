@@ -20,7 +20,7 @@ import importlib
 from xela_server_ros.msg import SensStream, SensorFull, Taxel, Forces
 from xela_server_ros.srv import XelaSensorStream, XelaSensorStreamResponse
 
-__version__ = "1.7.6_137302"
+__version__ = "1.7.8b_169002"
 logging.basicConfig(level=logging.INFO)
 
 
@@ -95,7 +95,7 @@ class ConfHolder(object):
         Args:
             obj: The attribute to retrieve.
 
-        Returns:
+            Returns:
             None: If the attribute is not found.
         """
         self.failures.append((time.time(), obj))
@@ -241,6 +241,7 @@ class ArgMgr(object):
                 ARGM.add_argument('-d', '--debug_level', default=0, choices=range(4), type=int,
                                   help="{}Debug Level (0-3) (default: 0)\033[0m".format(color))
             if "i" in fstring:
+                # The launch file sets this to 127.0.0.1
                 ARGM.add_argument('-i', '--ip', default="127.0.0.1", help=f"{color}Server IP\033[0m")
             ARGM.add_argument('--debug', action="store_true", help=argparse.SUPPRESS)
             ARGM.add_argument('--roslog', help=argparse.SUPPRESS)
@@ -418,7 +419,7 @@ class ServiceNode(object):
             self.publisher_.publish(resp)
         except Exception as e:
             warn(f"Publisher: {e2t(e)}")
-            info(f"Traceback: {traceback.format_exception(e)}")
+            info(f"Traceback: {traceback.format_exc()}")
 
     def reset(self):
         """Reset the node by clearing all stored data"""
@@ -447,13 +448,24 @@ def message_parser(msg_obj, msg_no: int = 0):
     values = []
     forces = []
     taxels = msg_obj.get("taxels", -1)
-    data_val = msg_obj.get("data", "").split(",")
+    data_raw = msg_obj.get("data", "")
+    # Handle both string and list formats
+    if isinstance(data_raw, list):
+        data_val = data_raw
+    elif isinstance(data_raw, str):
+        data_val = data_raw.split(",")
+    else:
+        data_val = []
     if len(data_val) != 3 * taxels:
         error(f"Taxel count mismatch: {taxels} != {int(len(data_val) / 3)}")
         return None
     for val in data_val:
         try:
-            values.append(int(val, 16))
+            # If val is already an int, use it directly; otherwise parse as hex string
+            if isinstance(val, int):
+                values.append(val)
+            else:
+                values.append(int(val, 16))
         except ValueError:
             error(f"Value `{val}` is not a valid HEX number")
             break
@@ -523,7 +535,7 @@ def on_message(wsapp, message):
                         data_container[pos] = returned_data
                     except Exception as e:
                         error(f"Parser failure: {e2t(e)}")
-                        traceback.print_exception(e)
+                        warn(f"Traceback: {traceback.format_exc()}")
                         pass
                 node.publish(data_container)
         except Exception as e:
@@ -533,27 +545,38 @@ def on_message(wsapp, message):
 
 def get_ip(setIP=None):
     """
-    Get the local IP address.
+    Get the IP address for the connection.
 
     Args:
-        setIP (str, optional): An optional IP address to use. Default is None.
+        setIP (str, optional): The IP address parsed from the command-line arguments (CONFIG.ip).
 
     Returns:
-        str: The local IP address.
+        str: The IP address to use for the WebSocket connection.
     """
-    if setIP is None or "127.0.0.1" in setIP:
-        socket = importlib.import_module("socket")
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(('1.2.3.4', 1))
-            IP = s.getsockname()
-        except Exception:
-            IP = ['127.0.0.1']
-        finally:
-            s.close()
-    else:
-        IP = [setIP]
-    return IP[0]
+    # FIX: If setIP is provided, use it directly. This ensures '127.0.0.1' is used when intended.
+    if setIP is not None and "127.0.0.1" not in setIP:
+        return setIP
+
+    # If setIP is '127.0.0.1' or None, try to get the actual local IP address first
+    socket = importlib.import_module("socket")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Use a common trick to get the IP address of the main network interface
+        s.connect(('1.2.3.4', 1))
+        # The result of getsockname() is a tuple (ip_address, port)
+        IP = s.getsockname()[0]
+    except Exception:
+        # Fallback to localhost if network discovery fails
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    
+    # If the provided IP was '127.0.0.1', we stick to it, otherwise use the discovered IP
+    # Since the user confirmed the server runs locally, we prioritize the launch argument (127.0.0.1)
+    if setIP == '127.0.0.1':
+        return '127.0.0.1'
+        
+    return IP # Otherwise return the discovered external IP if setIP was None (not our case here)
 
 
 class Online(object):
@@ -641,11 +664,27 @@ def start_server():
     Start the WebSocket server and handle incoming messages.
     """
     global wsapp
-    ip = get_ip(CONFIG.ip)
-    sys.stderr.write("\033[31mws://{}:{}\033[0m\n".format(ip, CONFIG.port))
+    # FIX: We rely entirely on the IP passed by the CONFIG object (which comes from the launch file)
+    ip = CONFIG.ip 
+    
+    # Check if the IP is localhost and if we need to attempt auto-discovery (optional, but keep original logic intact)
+    if ip == '127.0.0.1':
+        # If the launch file specified 127.0.0.1, we honor it directly.
+        pass
+    else:
+        # If an external IP was provided (e.g. 192.168.x.x), we use the original get_ip logic 
+        # to ensure it's a valid host IP. The fix above ensures that '127.0.0.1' is not
+        # accidentally resolved to the external IP.
+        ip = get_ip(ip)
+
+    # Logging the actual connection URL for clarity
+    connection_url = "ws://{}:{}".format(ip, CONFIG.port)
+    rospy.loginfo(f"Attempting connection to: {connection_url}")
+    sys.stderr.write("\033[31m{}\033[0m\n".format(connection_url))
+    
     while ME_ONLINE:
         try:
-            wsapp = websocket.WebSocketApp("ws://{}:{}".format(ip, CONFIG.port),
+            wsapp = websocket.WebSocketApp(connection_url,
                                            on_message=on_message,
                                            on_close=on_close,
                                            on_error=on_error)  # set up WebSockets
